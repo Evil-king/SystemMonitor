@@ -1,0 +1,9 @@
+.DS_Store
+
+# Build output (recreate with ./build.sh)
+SystemMonitor.app/
+AppIcon.iconset/
+
+# Xcode user state
+*.xcuserstate
+xcuserdata/
