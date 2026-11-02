@@ -1,6 +1,6 @@
 # 系统监视（macOS 菜单栏）
 
-一个不依赖 DSH、不依赖第三方运行时的本机菜单栏小程序。常驻菜单栏显示内存和磁盘占用，点开可以看明细，并找出当前最占内存的应用。
+一个不依赖 DSH、不依赖第三方运行时的本机菜单栏小程序。常驻菜单栏显示内存和磁盘占用，点开可以看明细，找出当前最占内存的应用，也可以一键清理磁盘。
 
 ![菜单栏状态](docs/status.png)
 
@@ -12,6 +12,7 @@
   - **其余应用**：第 11 个之后的应用放在「其余 N 个应用」二级菜单里，每一项同样可以点击退出
   - **内存**：已用 / 总量、可用、缓存、联动内存、交换空间
   - **磁盘**：每个挂载卷的已用 / 总量、可用、挂载路径
+  - **清理磁盘**：先扫描可释放空间，确认后清理缓存 / 日志 / 构建残留 / 废纸篓，完成时显示释放量
 - **点击某个应用即可释放内存**：
   - 弹出确认框，默认按钮是「取消」
   - 「退出应用」= 正常退出（应用可能会弹保存提示）
@@ -52,6 +53,18 @@ open ~/Applications/SystemMonitor.app
 2. 在「内存占用应用」里找到占内存最多的应用；第 11 个之后的在「其余 N 个应用」二级菜单。
 3. 点击该应用 → 选择「退出应用」或「强制退出」。
 4. 应用退出后，下一次刷新就会从列表消失，内存占用随之下降。
+
+### 清理磁盘
+
+1. 点菜单里的 **清理磁盘…**。
+2. 应用先用 `mac-cleanup.sh` 的预览模式扫描（只统计，不删除），菜单栏会显示「磁盘 扫描中…」。
+3. 扫描完成后弹出可释放空间，确认清理范围：
+   - 默认勾选「同时清理微信 / Chrome / WPS / Docker 缓存」；取消勾选则只清系统缓存、日志和废纸篓。
+   - 清理范围只包含可再生的缓存 / 日志 / 构建残留 / 废纸篓；**不会删除文档、照片、源码、聊天记录或 Docker 数据卷**。
+4. 点「开始清理」后异步执行，菜单栏显示「磁盘 清理中…」，完成后弹窗显示释放量和清理前后的剩余空间。
+5. 每次执行的完整输出写入 `~/Library/Logs/SystemMonitor-cleanup.log`，脚本自己的历史记录仍在 `~/.mac-cleanup.log`。
+
+清理脚本的查找顺序：`~/mac-cleanup.sh` → `~/bin/mac-cleanup.sh` → App 内置的 `Contents/Resources/mac-cleanup.sh` → `/usr/local/bin/mac-cleanup.sh` → `/opt/homebrew/bin/mac-cleanup.sh`。想调整清理规则时，改自己主目录里的脚本即可，App 会优先使用它。
 
 其他菜单项：
 
@@ -96,11 +109,14 @@ open SystemMonitor.app
 # 只读一次指标
 ./SystemMonitor.app/Contents/MacOS/SystemMonitor --once
 
+# 只跑清理预览（不会删除文件），并打印解析出的释放量
+./SystemMonitor.app/Contents/MacOS/SystemMonitor --clean-preview
+
 # 开发辅助：1.2 秒后自动展开菜单，2 秒后把状态栏和明细行渲染到目录
 open SystemMonitor.app --args --preview-menu --capture /tmp/sm-capture
 ```
 
-修改 `Sources/main.swift` 后重新 `./build.sh`，退出旧实例（菜单 → 退出系统监视），再打开即可。代码约 1100 行，全部在单文件里。
+修改 `Sources/main.swift` 后重新 `./build.sh`，退出旧实例（菜单 → 退出系统监视），再打开即可。代码约 1450 行，全部在单文件里；清理逻辑复用 `Scripts/mac-cleanup.sh`，构建时会复制进 App 的 Resources。
 
 登录项也可以从命令行开关（路径必须与当前 App 一致）：
 

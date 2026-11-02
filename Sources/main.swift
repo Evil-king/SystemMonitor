@@ -548,6 +548,183 @@ enum LaunchAtLogin {
     }
 }
 
+// MARK: - Disk cleanup
+
+/// Thin wrapper around the user's `mac-cleanup.sh`. The script is the single
+/// place that knows what is safe to remove (caches, logs, Trash), so the app
+/// only supplies confirmation, progress and a readable summary.
+enum DiskCleanup {
+    enum Mode {
+        case preview
+        case clean(includeAppCaches: Bool)
+
+        var isPreview: Bool {
+            if case .preview = self { return true }
+            return false
+        }
+    }
+
+    struct Outcome {
+        let status: Int32
+        let output: String
+        let freedText: String?
+        let freeSpaceChange: String?
+
+        var succeeded: Bool { status == 0 }
+    }
+
+    static var logURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/SystemMonitor-cleanup.log")
+    }
+
+    /// Prefer the copy the user maintains in their home directory, then the
+    /// copy embedded in the app, then common install locations.
+    static func scriptURL() -> URL? {
+        let manager = FileManager.default
+        let home = manager.homeDirectoryForCurrentUser
+        var candidates: [URL] = [
+            home.appendingPathComponent("mac-cleanup.sh"),
+            home.appendingPathComponent("bin/mac-cleanup.sh")
+        ]
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("mac-cleanup.sh") {
+            candidates.append(bundled)
+        }
+        candidates.append(URL(fileURLWithPath: "/usr/local/bin/mac-cleanup.sh"))
+        candidates.append(URL(fileURLWithPath: "/opt/homebrew/bin/mac-cleanup.sh"))
+        return candidates.first { manager.isExecutableFile(atPath: $0.path) }
+    }
+
+    /// Launch asynchronously; `completion` is delivered on the main queue.
+    @discardableResult
+    static func run(mode: Mode, script: URL, completion: @escaping (Outcome) -> Void) throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+
+        var arguments = [script.path]
+        switch mode {
+        case .preview:
+            break
+        case .clean(let includeAppCaches):
+            arguments.append(contentsOf: ["--clean", "-y"])
+            if !includeAppCaches {
+                arguments.append("--no-apps")
+            }
+        }
+        process.arguments = arguments
+        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+
+        // GUI apps inherit a minimal PATH; the script needs Homebrew tools
+        // such as `docker` when Docker Desktop is installed.
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        process.environment = environment
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        try process.run()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            let output = String(decoding: data, as: UTF8.self)
+            appendLog(output, mode: mode)
+
+            let outcome = Outcome(
+                status: process.terminationStatus,
+                output: output,
+                freedText: parseFreed(from: output),
+                freeSpaceChange: parseFreeSpaceChange(from: output)
+            )
+            DispatchQueue.main.async { completion(outcome) }
+        }
+        return process
+    }
+
+    /// Strip the ANSI colors the script emits when stdout is a terminal.
+    static func plainText(_ text: String) -> String {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return ansiRegex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
+    }
+
+    private static let ansiRegex = try! NSRegularExpression(
+        pattern: "\u{001B}\\[[0-9;]*[A-Za-z]"
+    )
+
+    private static func firstGroup(_ pattern: String, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              match.numberOfRanges > 1,
+              let valueRange = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[valueRange]).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func parseFreed(from output: String) -> String? {
+        firstGroup(
+            "(?:本次共释放约|预计可释放约)\\s*([0-9]+(?:\\.[0-9]+)?\\s*[KMGTP]?B)",
+            in: plainText(output)
+        )
+    }
+
+    private static func parseFreeSpaceChange(from output: String) -> String? {
+        let text = plainText(output)
+        guard let regex = try? NSRegularExpression(
+            pattern: "系统盘剩余:\\s*([0-9]+(?:\\.[0-9]+)?\\s*[KMGTP]?B)\\s*→\\s*([0-9]+(?:\\.[0-9]+)?\\s*[KMGTP]?B)"
+        ) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              match.numberOfRanges > 2,
+              let before = Range(match.range(at: 1), in: text),
+              let after = Range(match.range(at: 2), in: text) else { return nil }
+        return "\(text[before]) → \(text[after])"
+    }
+
+    /// Keep a local transcript so a failed cleanup can be diagnosed later.
+    private static func appendLog(_ output: String, mode: Mode) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let label: String
+        switch mode {
+        case .preview:
+            label = "preview"
+        case .clean(let includeAppCaches):
+            label = includeAppCaches ? "clean (with app caches)" : "clean"
+        }
+
+        var entry = "\n===== \(formatter.string(from: Date())) \(label) =====\n"
+        entry += output
+        if !entry.hasSuffix("\n") { entry += "\n" }
+        guard let data = entry.data(using: .utf8) else { return }
+
+        let manager = FileManager.default
+        try? manager.createDirectory(
+            at: logURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        // Keep the helper log below 1 MB; the script keeps its own history in
+        // ~/.mac-cleanup.log.
+        if let attributes = try? manager.attributesOfItem(atPath: logURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.intValue > 1_000_000 {
+            try? manager.removeItem(at: logURL)
+        }
+
+        if manager.fileExists(atPath: logURL.path) {
+            if let handle = try? FileHandle(forWritingTo: logURL) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            }
+        } else {
+            try? data.write(to: logURL, options: .atomic)
+        }
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -565,6 +742,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var appUsages: [AppUsage] = []
     private var pendingRefresh: DispatchWorkItem?
 
+    private enum CleanupPhase {
+        case idle
+        case scanning
+        case cleaning
+    }
+
+    private var cleanupPhase: CleanupPhase = .idle
+    private var cleanupItem: NSMenuItem?
+    private var cleanupHint: NSMenuItem?
+    private var cleanupProcess: Process?
+    private var busyTitle: String?
+    private var includeAppCaches = true
+
     private let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -579,6 +769,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let saved = UserDefaults.standard.double(forKey: "refreshInterval")
         interval = saved >= 2 && saved <= 120 ? saved : 5
+
+        if UserDefaults.standard.object(forKey: "cleanupIncludeAppCaches") != nil {
+            includeAppCaches = UserDefaults.standard.bool(forKey: "cleanupIncludeAppCaches")
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -631,6 +825,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer?.invalidate()
         timer = nil
         pendingRefresh?.cancel()
+        cleanupProcess?.terminate()
+        cleanupProcess = nil
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
@@ -680,6 +876,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateButton(_ reading: Reading) {
         guard let button = statusItem.button else { return }
+
+        if let busyTitle {
+            button.attributedTitle = NSAttributedString(string: busyTitle, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor.labelColor
+            ])
+            button.toolTip = L10n.t(
+                "正在使用 mac-cleanup.sh 处理，完成后会弹窗提示。",
+                "Running mac-cleanup.sh; a summary will appear when it finishes."
+            )
+            return
+        }
+
         let memoryPercent = percentOf(reading.memory.used, reading.memory.total)
         let diskPercent = reading.disks.first.map { percentOf($0.used, $0.total) } ?? 0
 
@@ -757,6 +966,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+
+        let cleanup = actionItem(
+            L10n.t("清理磁盘…", "Clean up disk…"),
+            #selector(cleanDisk(_:)),
+            ""
+        )
+        cleanup.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
+        cleanup.toolTip = L10n.t(
+            "扫描并清理缓存、日志与废纸篓；不会删除文档、照片或源码。",
+            "Scan and clean caches, logs and Trash; documents, photos and source stay."
+        )
+        menu.addItem(cleanup)
+        cleanupItem = cleanup
+
+        let cleanupHint = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        cleanupHint.attributedTitle = infoItem(L10n.t(
+            "缓存 / 日志 / 废纸篓 · 不会动文档和照片",
+            "Caches, logs & Trash · docs and photos stay"
+        ))
+        cleanupHint.isEnabled = false
+        menu.addItem(cleanupHint)
+        self.cleanupHint = cleanupHint
+
+        menu.addItem(.separator())
         menu.addItem(actionItem(L10n.t("刷新", "Refresh"), #selector(refreshNow(_:)), "r"))
 
         let intervalItem = NSMenuItem(
@@ -797,6 +1030,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(actionItem(L10n.t("退出系统监视", "Quit System Monitor"), #selector(quit(_:)), "q"))
 
+        applyCleanupState()
         statusItem.menu = menu
         self.menu = menu
         updateMenu(reading)
@@ -945,6 +1179,187 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: Actions
+
+    @objc private func cleanDisk(_ sender: Any?) {
+        guard cleanupPhase == .idle else {
+            NSSound.beep()
+            return
+        }
+        guard let script = DiskCleanup.scriptURL() else {
+            presentMissingCleanupScript()
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        startCleanup(mode: .preview, script: script)
+    }
+
+    private func startCleanup(mode: DiskCleanup.Mode, script: URL) {
+        cleanupPhase = mode.isPreview ? .scanning : .cleaning
+        busyTitle = mode.isPreview
+            ? L10n.t("磁盘 扫描中…", "Disk scanning…")
+            : L10n.t("磁盘 清理中…", "Disk cleaning…")
+        applyCleanupState()
+        if let reading { updateButton(reading) }
+
+        do {
+            cleanupProcess = try DiskCleanup.run(mode: mode, script: script) { [weak self] outcome in
+                guard let self else { return }
+                self.cleanupProcess = nil
+                self.cleanupPhase = .idle
+                self.busyTitle = nil
+                self.refresh()
+                self.applyCleanupState()
+
+                if mode.isPreview {
+                    self.presentPreview(outcome, script: script)
+                } else {
+                    self.presentCleanupResult(outcome)
+                }
+            }
+        } catch {
+            cleanupPhase = .idle
+            busyTitle = nil
+            cleanupProcess = nil
+            if let reading { updateButton(reading) }
+            applyCleanupState()
+            presentCleanupError(
+                message: L10n.t("无法启动清理脚本", "Could not start the cleanup script"),
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    private func applyCleanupState() {
+        switch cleanupPhase {
+        case .idle:
+            cleanupItem?.title = L10n.t("清理磁盘…", "Clean up disk…")
+            cleanupItem?.isEnabled = true
+            cleanupHint?.isHidden = false
+        case .scanning:
+            cleanupItem?.title = L10n.t("正在扫描…", "Scanning…")
+            cleanupItem?.isEnabled = false
+            cleanupHint?.isHidden = true
+        case .cleaning:
+            cleanupItem?.title = L10n.t("正在清理…", "Cleaning…")
+            cleanupItem?.isEnabled = false
+            cleanupHint?.isHidden = true
+        }
+    }
+
+    private func presentPreview(_ outcome: DiskCleanup.Outcome, script: URL) {
+        guard outcome.succeeded else {
+            presentCleanupFailure(outcome, zhTitle: "清理预览失败", enTitle: "Cleanup preview failed")
+            return
+        }
+
+        let freed = outcome.freedText ?? L10n.t("未知", "unknown")
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L10n.t("可释放约 \(freed)（尚未删除）", "About \(freed) can be freed")
+        alert.informativeText = L10n.t(
+            "将清理：系统与应用缓存、日志、构建残留、废纸篓，以及微信 / Chrome / WPS 的缓存和 Docker 的构建缓存。\n不会删除：文档、照片、源码、聊天记录、Docker 数据卷。\n\n预览没有删除任何文件；取消勾选应用缓存时，实际释放量会少于该估算。",
+            "Will clean: system and app caches, logs, build leftovers, Trash, plus WeChat / Chrome / WPS caches and Docker build cache.\nWill not touch: documents, photos, source code, chat history or Docker volumes.\n\nThe preview deleted nothing; unchecking app caches means the actual result will be smaller than this estimate."
+        )
+
+        let checkbox = NSButton(
+            checkboxWithTitle: L10n.t(
+                "同时清理微信 / Chrome / WPS / Docker 缓存",
+                "Also clean WeChat / Chrome / WPS / Docker caches"
+            ),
+            target: nil,
+            action: nil
+        )
+        checkbox.state = includeAppCaches ? .on : .off
+        checkbox.sizeToFit()
+        checkbox.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: max(330, checkbox.frame.width),
+            height: checkbox.frame.height
+        )
+        alert.accessoryView = checkbox
+
+        alert.addButton(withTitle: L10n.t("取消", "Cancel"))
+        alert.addButton(withTitle: L10n.t("开始清理", "Clean now"))
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+
+        includeAppCaches = checkbox.state == .on
+        UserDefaults.standard.set(includeAppCaches, forKey: "cleanupIncludeAppCaches")
+        startCleanup(mode: .clean(includeAppCaches: includeAppCaches), script: script)
+    }
+
+    private func presentCleanupResult(_ outcome: DiskCleanup.Outcome) {
+        guard outcome.succeeded else {
+            presentCleanupFailure(outcome, zhTitle: "清理未完成", enTitle: "Cleanup did not finish")
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L10n.t("磁盘清理完成", "Disk cleanup complete")
+
+        var lines: [String] = []
+        if let freed = outcome.freedText {
+            lines.append(L10n.t("本次释放约 \(freed)", "Freed about \(freed)"))
+        }
+        if let change = outcome.freeSpaceChange {
+            lines.append(L10n.t("系统盘剩余：\(change)", "Free space: \(change)"))
+        }
+        lines.append(L10n.t(
+            "已清理缓存、日志与废纸篓。部分应用下次启动会重新生成缓存。",
+            "Caches, logs and Trash were cleaned. Some apps will rebuild caches on next launch."
+        ))
+        alert.informativeText = lines.joined(separator: "\n")
+        alert.addButton(withTitle: L10n.t("好", "OK"))
+        alert.addButton(withTitle: L10n.t("查看日志", "Show log"))
+
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSWorkspace.shared.open(DiskCleanup.logURL)
+        }
+    }
+
+    private func presentCleanupFailure(_ outcome: DiskCleanup.Outcome, zhTitle: String, enTitle: String) {
+        let plain = DiskCleanup.plainText(outcome.output).trimmingCharacters(in: .whitespacesAndNewlines)
+        let tail = plain.count > 900 ? String(plain.suffix(900)) : plain
+        var detail = L10n.t(
+            "清理脚本退出码 \(outcome.status)。可查看日志了解详情。",
+            "The cleanup script exited with status \(outcome.status). See the log for details."
+        )
+        if !tail.isEmpty {
+            detail += "\n\n" + tail
+        }
+        presentCleanupError(message: L10n.t(zhTitle, enTitle), detail: detail)
+    }
+
+    private func presentCleanupError(message: String, detail: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = message
+        alert.informativeText = detail
+        alert.addButton(withTitle: L10n.t("好", "OK"))
+        alert.addButton(withTitle: L10n.t("查看日志", "Show log"))
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSWorkspace.shared.open(DiskCleanup.logURL)
+        }
+    }
+
+    private func presentMissingCleanupScript() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = L10n.t("找不到清理脚本", "Cleanup script not found")
+        alert.informativeText = L10n.t(
+            "应用会在 ~/mac-cleanup.sh、应用内置资源以及 /usr/local/bin 中查找 mac-cleanup.sh。请确认脚本存在且可执行，或重新安装应用。",
+            "The app looks for mac-cleanup.sh in ~/mac-cleanup.sh, its bundled resources and /usr/local/bin. Make sure the script exists and is executable, or reinstall the app."
+        )
+        alert.addButton(withTitle: L10n.t("好", "OK"))
+        alert.runModal()
+    }
 
     @objc private func releaseApp(_ sender: NSMenuItem) {
         guard let number = sender.representedObject as? NSNumber else { return }
@@ -1180,6 +1595,27 @@ if CommandLine.arguments.contains("--disable-login") {
     let disabled = LaunchAtLogin.setEnabled(false)
     print(disabled ? "disabled" : "failed")
     exit(disabled ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--clean-preview") {
+    guard let script = DiskCleanup.scriptURL() else {
+        print("no cleanup script found")
+        exit(2)
+    }
+    do {
+        try DiskCleanup.run(mode: .preview, script: script) { outcome in
+            print(DiskCleanup.plainText(outcome.output))
+            print("---")
+            print("status=\(outcome.status)")
+            print("freed=\(outcome.freedText ?? "nil")")
+            print("freeSpaceChange=\(outcome.freeSpaceChange ?? "nil")")
+            exit(outcome.succeeded ? 0 : 1)
+        }
+        RunLoop.main.run()
+    } catch {
+        print("failed: \(error)")
+        exit(1)
+    }
 }
 
 if CommandLine.arguments.contains("--once") {

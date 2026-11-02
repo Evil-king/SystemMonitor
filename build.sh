@@ -16,6 +16,8 @@ xcrun swiftc \
 
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/Scripts/mac-cleanup.sh" "$APP/Contents/Resources/mac-cleanup.sh"
+chmod +x "$APP/Contents/Resources/mac-cleanup.sh"
 codesign --force --sign - "$APP" >/dev/null
 
 echo "Built $APP"
