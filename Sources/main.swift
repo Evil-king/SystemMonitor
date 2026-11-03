@@ -604,11 +604,14 @@ enum DiskCleanup {
         var arguments = [script.path]
         switch mode {
         case .preview:
-            break
+            // Count unused Docker images in the estimate as well.
+            arguments.append("--docker-all")
         case .clean(let includeAppCaches):
-            arguments.append(contentsOf: ["--clean", "-y"])
+            arguments.append(contentsOf: ["--clean", "-y", "--docker-all"])
             if !includeAppCaches {
-                arguments.append("--no-apps")
+                // Keep Docker cleanup (including unused images) on; only skip
+                // the WeChat / Chrome / WPS cache sections.
+                arguments.append(contentsOf: ["--no-wechat", "--no-chrome", "--no-wps"])
             }
         }
         process.arguments = arguments
@@ -1258,14 +1261,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.alertStyle = .informational
         alert.messageText = L10n.t("可释放约 \(freed)（尚未删除）", "About \(freed) can be freed")
         alert.informativeText = L10n.t(
-            "将清理：系统与应用缓存、日志、构建残留、废纸篓，以及微信 / Chrome / WPS 的缓存和 Docker 的构建缓存。\n不会删除：文档、照片、源码、聊天记录、Docker 数据卷。\n\n预览没有删除任何文件；取消勾选应用缓存时，实际释放量会少于该估算。",
-            "Will clean: system and app caches, logs, build leftovers, Trash, plus WeChat / Chrome / WPS caches and Docker build cache.\nWill not touch: documents, photos, source code, chat history or Docker volumes.\n\nThe preview deleted nothing; unchecking app caches means the actual result will be smaller than this estimate."
+            "将清理：系统与应用缓存、日志、构建残留、废纸篓，微信 / Chrome / WPS 的缓存，以及 Docker 的未使用镜像、停止容器与构建缓存。\n不会删除：文档、照片、源码、聊天记录、Docker 数据卷。\n\n删除 Docker 未使用镜像后，下次使用需要重新 pull / build。预览没有删除任何文件；取消勾选应用缓存时，实际释放量会少于该估算。",
+            "Will clean: system and app caches, logs, build leftovers, Trash, WeChat / Chrome / WPS caches, and Docker unused images, stopped containers and build cache.\nWill not touch: documents, photos, source code, chat history or Docker volumes.\n\nDocker images removed here must be pulled or built again next time. The preview deleted nothing; unchecking app caches means the actual result will be smaller than this estimate."
         )
 
         let checkbox = NSButton(
             checkboxWithTitle: L10n.t(
-                "同时清理微信 / Chrome / WPS / Docker 缓存",
-                "Also clean WeChat / Chrome / WPS / Docker caches"
+                "同时清理微信 / Chrome / WPS 缓存",
+                "Also clean WeChat / Chrome / WPS caches"
             ),
             target: nil,
             action: nil
