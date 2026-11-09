@@ -59,9 +59,9 @@ open ~/Applications/SystemMonitor.app
 1. 点菜单里的 **清理磁盘…**。
 2. 应用先用 `mac-cleanup.sh` 的预览模式扫描（只统计，不删除），菜单栏会显示「磁盘 扫描中…」。
 3. 扫描完成后弹出可释放空间，确认清理范围：
-   - 默认勾选「同时清理微信 / Chrome / WPS 缓存」；取消勾选则只清系统缓存、日志和废纸篓。
+   - 默认勾选「同时清理所有已装软件的缓存」：脚本会扫描 `/Applications` 与 `~/Applications` 里装的每个软件，只清它们数据目录下名为 `Cache` / `Caches` / `Code Cache` / `GPUCache` / `Service Worker` / `Shared Dictionary` / `*_cache` / `log(s)` 的子目录；取消勾选则只清系统缓存、日志和废纸篓。
    - Docker 的清理始终包含：未使用镜像、停止的容器、构建缓存和日志（`--docker-all`）。删除未使用镜像后，下次使用需要重新 pull / build。
-   - 清理范围只包含可再生的缓存 / 日志 / 构建残留 / 废纸篓；**不会删除文档、照片、源码、聊天记录或 Docker 数据卷**。
+   - 清理范围只包含可再生的缓存 / 日志 / 构建残留 / 废纸篓；**不会删除文档、照片、源码、聊天记录（含微信 `xwechat_files`）、账号、插件或 Docker 数据卷**。
 4. 点「开始清理」后异步执行，菜单栏显示「磁盘 清理中…」，完成后弹窗显示释放量和清理前后的剩余空间。
 5. 每次执行的完整输出写入 `~/Library/Logs/SystemMonitor-cleanup.log`，脚本自己的历史记录仍在 `~/.mac-cleanup.log`。
 
