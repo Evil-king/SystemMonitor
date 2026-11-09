@@ -604,13 +604,15 @@ enum DiskCleanup {
         var arguments = [script.path]
         switch mode {
         case .preview:
-            // Count unused Docker images in the estimate as well.
-            arguments.append("--docker-all")
+            // Docker images are no longer pruned: re-pulling them is the single
+            // biggest way this tool can make the machine feel slow afterwards,
+            // so the estimate must not count them either.
+            break
         case .clean(let includeAppCaches):
-            arguments.append(contentsOf: ["--clean", "-y", "--docker-all"])
+            arguments.append(contentsOf: ["--clean", "-y"])
             if !includeAppCaches {
-                // Keep Docker cleanup (including unused images) on; only skip
-                // the scanned per-app cache section.
+                // Docker cleanup stays on; only the scanned per-app cache
+                // section is skipped.
                 arguments.append("--no-apps")
             }
         }
@@ -1261,14 +1263,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.alertStyle = .informational
         alert.messageText = L10n.t("可释放约 \(freed)（尚未删除）", "About \(freed) can be freed")
         alert.informativeText = L10n.t(
-            "将清理：系统与应用缓存、日志、构建残留、废纸篓，所有已安装软件各自的缓存，以及 Docker 的未使用镜像、停止容器与构建缓存。\n不会删除：文档、照片、源码、聊天记录、Docker 数据卷。\n\n删除 Docker 未使用镜像后，下次使用需要重新 pull / build。预览没有删除任何文件；取消勾选应用缓存时，实际释放量会少于该估算。",
-            "Will clean: system and app caches, logs, build leftovers, Trash, caches of every installed app, and Docker unused images, stopped containers and build cache.\nWill not touch: documents, photos, source code, chat history or Docker volumes.\n\nDocker images removed here must be pulled or built again next time. The preview deleted nothing; unchecking app caches means the actual result will be smaller than this estimate."
+            "将清理：系统与应用缓存、日志、构建残留、废纸篓，以及已退出软件的缓存。\n正在运行的软件会跳过——清它们的缓存会被立刻重建，反而让机器发卡；退出这些软件后再清一次即可。\n不会删除：文档、照片、源码、聊天记录、Docker 数据卷、Docker 镜像。\n\n预览没有删除任何文件；取消勾选应用缓存时，实际释放量会少于该估算。",
+            "Will clean: system and app caches, logs, build leftovers, Trash, and caches of apps that are not running.\nRunning apps are skipped on purpose - clearing their caches just makes them rebuild them and the machine stutter; quit them and run it again.\nWill not touch: documents, photos, source code, chat history, Docker volumes or Docker images.\n\nThe preview deleted nothing; unchecking app caches means the actual result will be smaller than this estimate."
         )
 
         let checkbox = NSButton(
             checkboxWithTitle: L10n.t(
-                "同时清理所有已装软件的缓存",
-                "Also clean caches of all installed apps"
+                "同时清理已退出软件的缓存（运行中的会跳过）",
+                "Also clean caches of apps that are not running"
             ),
             target: nil,
             action: nil

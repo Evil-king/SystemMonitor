@@ -8,6 +8,9 @@
 #  只清理可再生的东西：缓存 / 日志 / 构建产物 / 废纸篓。
 #  永不触碰：文档、照片、源码、聊天记录、账号、设置、插件。
 #
+#  【不打扰正在用的软件】默认跳过正在运行的应用的缓存——清掉后它们会当场重建，
+#  明显发卡；退出应用后再跑一次即可。
+#
 #  【软件不写死】每次运行都会扫描 /Applications 与 ~/Applications 里
 #  装了哪些软件，再扫这些软件在 ~/Library 下的数据目录，
 #  只清理"名字就是缓存/日志"的子目录（Cache、Caches、CacheStorage、
@@ -28,7 +31,7 @@ set -u
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 
 MODE="preview"; ASSUME_YES=0
-CLEAN_APPS=1; CLEAN_DOCKER=1; CLEAN_DOCKER_ALL=0
+CLEAN_APPS=1; CLEAN_RUNNING=0; CLEAN_DOCKER=1; CLEAN_DOCKER_ALL=0
 CLEAN_DOWNLOADS=0; DOWNLOADS_DAYS=90; REPORT_HOME=0
 CLEANING=0; TOTAL_KB=0
 SCAN_TOP="${SCAN_TOP:-12}"     # 预览里列多少个软件，可用 SCAN_TOP=30 ./mac-cleanup.sh 调整
@@ -47,6 +50,7 @@ usage() {
 
   按软件跳过（软件清单是自动扫出来的，不用登记）：
   --no-apps     跳过"已安装软件缓存扫描"
+  --include-running  连正在运行的软件也清（默认跳过它们，避免当场重建缓存、系统发卡）
   --no-wechat / --no-chrome / --no-wps   旧参数，等价于 --no-apps（兼容老版本菜单栏）
   --no-docker   跳过 Docker
   --docker-all  连"未被任何容器使用的 Docker 镜像"也删掉（下次要重新 pull/build）
@@ -63,6 +67,7 @@ for arg in "$@"; do
     -y|--yes)      ASSUME_YES=1 ;;
     --apps)        CLEAN_APPS=1 ;;
     --no-apps)     CLEAN_APPS=0 ;;
+    --include-running) CLEAN_RUNNING=1 ;;   # 连正在运行的软件也清（会更卡）
     # 兼容旧版菜单栏传的参数（那时是分开的微信/Chrome/WPS 段）
     --no-wechat|--no-chrome|--no-wps) CLEAN_APPS=0 ;;
     --docker)      CLEAN_DOCKER=1 ;;
@@ -94,7 +99,9 @@ SCAN_RAW=$(mktemp) || exit 1
 SCAN_DIRS=$(mktemp) || exit 1
 SCAN_ROWS=$(mktemp) || exit 1
 SCAN_STATS=$(mktemp) || exit 1
-trap 'rm -f "$APP_MAP" "$SCAN_RAW" "$SCAN_DIRS" "$SCAN_ROWS" "$SCAN_STATS"' EXIT
+SCAN_SKIP=$(mktemp) || exit 1
+RUNNING_APPS=$(mktemp) || exit 1
+trap 'rm -f "$APP_MAP" "$SCAN_RAW" "$SCAN_DIRS" "$SCAN_ROWS" "$SCAN_STATS" "$SCAN_SKIP" "$RUNNING_APPS"' EXIT
 trap 'exit 130' INT TERM
 
 size_kb()  { du -sk "$1" 2>/dev/null | awk '{print $1+0}'; }
@@ -152,6 +159,11 @@ run_tool() {
 # 2) 扫 ~/Library/Containers/*/Data 与 ~/Library/Application Support/*
 # 3) 只认"缓存/日志目录名白名单"，别的一律不碰
 
+# 正在运行的 App（只看 .app 包里的主进程），用来避免"清完缓存当场重建"
+running_app_paths() {
+  ps -Ao comm= 2>/dev/null | sed -n 's|^\(/.*\.app\)/Contents/MacOS/.*|\1|p' | sort -u
+}
+
 build_app_map() {
   local app id nm
   : >"$APP_MAP"
@@ -163,7 +175,7 @@ build_app_map() {
     nm=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$app/Contents/Info.plist" 2>/dev/null) || nm=""
     [ -n "${nm:-}" ] || nm=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$app/Contents/Info.plist" 2>/dev/null) || nm=""
     [ -n "${nm:-}" ] || nm=$(basename "$app" .app)
-    printf '%s\t%s\n' "$id" "$nm" >>"$APP_MAP"
+    printf '%s\t%s\t%s\n' "$id" "$nm" "$app" >>"$APP_MAP"
   done
 }
 
@@ -209,58 +221,76 @@ scan_app_caches() {
 scan_clean() { find "$1" -mindepth 1 -delete 2>/dev/null; }
 
 do_apps() {
-  local apps n=0 total i=0 rest_kb=0 rest_n=0 k c l
+  local apps n=0 total i=0 rest_kb=0 rest_n=0 k c l skip_kb=0 skip_n=0 skipped=""
 
   printf '   正在扫描已安装软件（20~30 秒）……\n'
   build_app_map
   apps=$(wc -l <"$APP_MAP" | tr -d ' ')
+  running_app_paths >"$RUNNING_APPS"
   scan_app_caches
 
-  # 并行量体积：一次 du 一批，避免两千多个进程启动开销
+  # 并行量体积；nice 让扫描不跟前台抢资源（默认 4 路，别开太猛）
   if [ -s "$SCAN_DIRS" ]; then
-    tr '\n' '\0' <"$SCAN_DIRS" | xargs -0 -P 8 -n 25 du -sk 2>/dev/null >"$SCAN_RAW"
+    tr '\n' '\0' <"$SCAN_DIRS" | xargs -0 -P 4 -n 25 nice -n 10 du -sk 2>/dev/null >"$SCAN_RAW"
   else
     : >"$SCAN_RAW"
   fi
 
-  # 挂上"这堆缓存属于哪个软件"，顺手过滤掉 <1MB 的
-  awk -F'\t' -v OFS='\t' '
-    NR == FNR { name[$1] = $2; next }
+  # 标出"属于哪个软件"以及"这个软件是不是正开着"
+  awk -F'\t' -v OFS='\t' -v force="$CLEAN_RUNNING" '
+    FILENAME == ARGV[1] { name[$1] = $2; apath[$1] = $3; next }
+    FILENAME == ARGV[2] { run[$0] = 1; next }
     {
       kb = $1 + 0
       if (kb < 1024) next
-      p = $2; m = split(p, seg, "/"); lab = ""
+      p = $2; m = split(p, seg, "/"); lab = ""; live = 0
       for (i = 1; i < m; i++)
         if (seg[i] == "Containers" && seg[i + 1] != "") {
-          id = seg[i + 1]; lab = (id in name) ? name[id] : id; break
+          id = seg[i + 1]; lab = (id in name) ? name[id] : id
+          if ((id in apath) && (apath[id] in run)) live = 1
+          break
         }
-      if (lab == "")
+      if (lab == "") {
         for (i = 1; i < m; i++)
           if (seg[i] == "Application Support" && seg[i + 1] != "") { lab = seg[i + 1]; break }
+        for (r in run) {
+          b = r; sub(/\/$/, "", b); nn = split(b, a2, "/"); b = a2[nn]; sub(/\.app$/, "", b)
+          if (b != "" && (index(b, lab) == 1 || index(lab, b) == 1)) { live = 1; break }
+        }
+      }
       if (lab == "") lab = "其他"
-      print kb, lab, p
-    }' "$APP_MAP" "$SCAN_RAW" >"$SCAN_ROWS"
+      if (force == 1) live = 0
+      print kb, lab, p, live
+    }' "$APP_MAP" "$RUNNING_APPS" "$SCAN_RAW" >"$SCAN_ROWS"
 
-  n=$(wc -l <"$SCAN_ROWS" | tr -d ' ')
-  if [ "$n" -eq 0 ]; then
+  awk -F'\t' '$4 == 1' "$SCAN_ROWS" >"$SCAN_SKIP"   # 软件开着，先不动
+  awk -F'\t' '$4 != 1' "$SCAN_ROWS" >"$SCAN_DIRS"   # 可以清
+
+  skip_kb=$(awk -F'\t' '{ s += $1 } END { print s + 0 }' "$SCAN_SKIP")
+  skip_n=$(wc -l <"$SCAN_SKIP" | tr -d ' ')
+  n=$(wc -l <"$SCAN_DIRS" | tr -d ' ')
+
+  if [ "$n" -eq 0 ] && [ "$skip_n" -eq 0 ]; then
     echo "   - 没扫到可清理的应用缓存（已装软件 ${apps} 个）"
     return 0
   fi
 
-  if [ "$CLEANING" -eq 1 ]; then
-    while IFS=$'\t' read -r k c l; do
+  if [ "$CLEANING" -eq 1 ] && [ "$n" -gt 0 ]; then
+    while IFS=$'\t' read -r k c l _; do
       scan_clean "$l"
-    done <"$SCAN_ROWS"
+    done <"$SCAN_DIRS"
   fi
 
   awk -F'\t' '{ s[$2] += $1; c[$2]++ }
-    END { for (l in s) printf "%s\t%d\t%s\n", s[l], c[l], l }' "$SCAN_ROWS" \
+    END { for (l in s) printf "%s\t%d\t%s\n", s[l], c[l], l }' "$SCAN_DIRS" \
     | sort -rn >"$SCAN_STATS"
 
   total=$(awk -F'\t' '{ s += $1 } END { print s + 0 }' "$SCAN_STATS")
   TOTAL_KB=$((TOTAL_KB + total))
 
-  if [ "$CLEANING" -eq 1 ]; then
+  if [ "$n" -eq 0 ]; then
+    printf '   - 可清的应用缓存都在正在运行的软件里（约 %s），本次不动\n' "$(human "$skip_kb")"
+  elif [ "$CLEANING" -eq 1 ]; then
     printf '   ✓ 共清理 %s 处缓存，释放 %s（已装软件 %s 个）\n' "$n" "$(human "$total")" "$apps"
   else
     printf '   · 共 %s 处缓存，约 %s（已装软件 %s 个）\n' "$n" "$(human "$total")" "$apps"
@@ -277,6 +307,13 @@ do_apps() {
   done <"$SCAN_STATS"
   [ "$rest_n" -gt 0 ] && printf '     · 其余 %s 个软件 —— %s（%s 处）\n' "$((i - SCAN_TOP))" "$(human "$rest_kb")" "$rest_n"
 
+  if [ "$skip_n" -gt 0 ]; then
+    skipped=$(awk -F'\t' '{ s[$2] += $1 } END { for (l in s) printf "%s、", l }' "$SCAN_SKIP")
+    skipped=${skipped%、}
+    printf '   - 正在运行、本次跳过：%s（%s 处，约 %s）\n' "$skipped" "$skip_n" "$(human "$skip_kb")"
+    echo '     退出这些软件后再跑一次，就能把它们那部分也清掉'
+  fi
+  echo '     （清运行中的软件会让它当场重建缓存、明显发卡，所以默认不动它）'
   echo '     （用户数据：聊天记录 / 数据库 / 设置 / 账号 / 插件 都不在清理范围内）'
   return 0
 }
